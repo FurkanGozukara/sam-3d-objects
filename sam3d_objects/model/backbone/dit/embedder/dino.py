@@ -1,10 +1,28 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+import os
 import torch
 from typing import Optional, Dict, Any
 import warnings
 from torchvision.transforms import Normalize
 import torch.nn.functional as F
 from loguru import logger
+
+
+def _get_local_hub_dir():
+    """
+    Get the local hub directory for DINOv2 models.
+    Checks for models in sam-3d-objects/models/dinov2/hub directory.
+    """
+    # Try to find the models directory relative to the sam3d_objects package
+    current_file = os.path.abspath(__file__)
+    # Navigate up from sam3d_objects/model/backbone/dit/embedder/dino.py to sam-3d-objects/
+    sam3d_root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(current_file))))))
+    local_hub_dir = os.path.join(sam3d_root, "models", "dinov2", "hub")
+    
+    if os.path.isdir(local_hub_dir):
+        return local_hub_dir
+    return None
 
 
 class Dino(torch.nn.Module):
@@ -20,6 +38,7 @@ class Dino(torch.nn.Module):
         prenorm_features: bool = False,
         freeze_backbone: bool = True,
         prune_network: bool = False,  # False for backward compatible
+        hub_dir: Optional[str] = None,  # Custom hub directory for local models
     ):
         super().__init__()
         if backbone_kwargs is None:
@@ -28,22 +47,36 @@ class Dino(torch.nn.Module):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             
-            logger.info(f"Loading DINO model: {dino_model} from {repo_or_dir} (source: {source})")
-            if backbone_kwargs:
-                logger.info(f"DINO backbone kwargs: {backbone_kwargs}")
+            # Check for local hub directory
+            local_hub = hub_dir or _get_local_hub_dir()
+            original_hub_dir = None
             
-            self.backbone = torch.hub.load(
-                repo_or_dir=repo_or_dir,
-                model=dino_model,
-                source=source,
-                verbose=False,
-                **backbone_kwargs,
-            )
+            if local_hub and os.path.isdir(local_hub):
+                logger.info(f"Using local DINOv2 hub directory: {local_hub}")
+                original_hub_dir = torch.hub.get_dir()
+                torch.hub.set_dir(local_hub)
             
-            # Log model properties after loading
-            logger.info(f"Loaded DINO model - type: {type(self.backbone)}, "
-                        f"embed_dim: {self.backbone.embed_dim}, "
-                        f"patch_size: {getattr(self.backbone.patch_embed, 'patch_size', 'N/A')}")
+            try:
+                logger.info(f"Loading DINO model: {dino_model} from {repo_or_dir} (source: {source})")
+                if backbone_kwargs:
+                    logger.info(f"DINO backbone kwargs: {backbone_kwargs}")
+                
+                self.backbone = torch.hub.load(
+                    repo_or_dir=repo_or_dir,
+                    model=dino_model,
+                    source=source,
+                    verbose=False,
+                    **backbone_kwargs,
+                )
+                
+                # Log model properties after loading
+                logger.info(f"Loaded DINO model - type: {type(self.backbone)}, "
+                            f"embed_dim: {self.backbone.embed_dim}, "
+                            f"patch_size: {getattr(self.backbone.patch_embed, 'patch_size', 'N/A')}")
+            finally:
+                # Restore original hub directory
+                if original_hub_dir is not None:
+                    torch.hub.set_dir(original_hub_dir)
 
 
         self.resize_input_size = (input_size, input_size)

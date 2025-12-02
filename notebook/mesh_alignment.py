@@ -17,6 +17,18 @@ from pytorch3d.renderer import PerspectiveCameras, RasterizationSettings, MeshRa
 from moge.model.v1 import MoGeModel
 
 
+def _get_local_moge_path():
+    """Get local MoGe model path if it exists."""
+    # Try to find the models directory relative to this file
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    sam3d_root = os.path.dirname(current_dir)  # Go up from notebook/ to sam-3d-objects/
+    local_model_path = os.path.join(sam3d_root, "models", "moge", "model.pt")
+    
+    if os.path.isfile(local_model_path):
+        return local_model_path
+    return None
+
+
 def load_3db_mesh(mesh_path, device='cuda'):
     """Load 3DB mesh and convert from OpenGL to PyTorch3D coordinates."""
     mesh = trimesh.load(mesh_path)
@@ -34,7 +46,25 @@ def load_3db_mesh(mesh_path, device='cuda'):
 
 def get_moge_pointcloud(image_tensor, device='cuda'):
     """Generate MoGe point cloud from image tensor."""
-    moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
+    # Check for local model first
+    local_path = _get_local_moge_path()
+    
+    if local_path:
+        print(f"[INFO] Loading MoGe model weights from local path: {local_path}")
+        # Load model architecture (may download config on first run)
+        try:
+            moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl", local_files_only=True)
+        except Exception:
+            print("[INFO] Downloading MoGe model config (one-time)...")
+            moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl")
+        # Load local weights
+        state_dict = torch.load(local_path, map_location=device, weights_only=True)
+        moge_model.load_state_dict(state_dict, strict=True)
+        moge_model = moge_model.to(device)
+    else:
+        print("[INFO] Loading MoGe model from HuggingFace...")
+        moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
+    
     moge_model.eval()
     with torch.no_grad():
         moge_output = moge_model.infer(image_tensor)

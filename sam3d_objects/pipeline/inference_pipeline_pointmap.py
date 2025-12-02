@@ -325,14 +325,20 @@ class InferencePipelinePointMap(InferencePipeline):
         use_vertex_color=False,
         stage1_inference_steps=None,
         stage2_inference_steps=None,
+        stage1_cfg_strength=None,
+        stage2_cfg_strength=None,
         use_stage1_distillation=False,
         use_stage2_distillation=False,
         pointmap=None,
         decode_formats=None,
         estimate_plane=False,
+        simplify_ratio=0.95,
+        texture_size=1024,
+        progress_callback=None,
     ) -> dict:
         image = self.merge_image_and_mask(image, mask)
-        with self.device: 
+        with self.device:
+            self._emit_progress(progress_callback, 0.05, "Computing depth & pointmap")
             pointmap_dict = self.compute_pointmap(image, pointmap)
             pointmap = pointmap_dict["pointmap"]
             pts = type(self)._down_sample_img(pointmap)
@@ -341,6 +347,7 @@ class InferencePipelinePointMap(InferencePipeline):
             if estimate_plane:
                 return self.estimate_plane(pointmap_dict, image)
 
+            self._emit_progress(progress_callback, 0.15, "Preprocessing inputs")
             ss_input_dict = self.preprocess_image(
                 image, self.ss_preprocessor, pointmap=pointmap
             )
@@ -348,10 +355,13 @@ class InferencePipelinePointMap(InferencePipeline):
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
             if seed is not None:
                 torch.manual_seed(seed)
+            self._emit_progress(progress_callback, 0.35, "Sampling sparse structure")
             ss_return_dict = self.sample_sparse_structure(
                 ss_input_dict,
                 inference_steps=stage1_inference_steps,
+                cfg_strength=stage1_cfg_strength,
                 use_distillation=use_stage1_distillation,
+                progress_callback=progress_callback,
             )
 
             # We could probably use the decoder from the models themselves
@@ -364,6 +374,7 @@ class InferencePipelinePointMap(InferencePipeline):
                     scene_shift=pointmap_shift,
                 )
             )
+            self._emit_progress(progress_callback, 0.45, "Decoding pose & scale")
 
             logger.info(f"Rescaling scale by {ss_return_dict['downsample_factor']} after downsampling")
             ss_return_dict["scale"] = ss_return_dict["scale"] * ss_return_dict["downsample_factor"]
@@ -371,6 +382,7 @@ class InferencePipelinePointMap(InferencePipeline):
             if stage1_only:
                 logger.info("Finished!")
                 ss_return_dict["voxel"] = ss_return_dict["coords"][:, 1:] / 64 - 0.5
+                self._emit_progress(progress_callback, 1.0, "Inference complete")
                 return {
                     **ss_return_dict,
                     "pointmap": pts.cpu().permute((1, 2, 0)),  # HxWx3
@@ -379,18 +391,24 @@ class InferencePipelinePointMap(InferencePipeline):
                 # return ss_return_dict
 
             coords = ss_return_dict["coords"]
+            self._emit_progress(progress_callback, 0.6, "Sampling latent structure")
             slat = self.sample_slat(
                 slat_input_dict,
                 coords,
                 inference_steps=stage2_inference_steps,
+                cfg_strength=stage2_cfg_strength,
                 use_distillation=use_stage2_distillation,
+                progress_callback=progress_callback,
             )
+            self._emit_progress(progress_callback, 0.75, "Decoding outputs")
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats
             )
             outputs = self.postprocess_slat_output(
-                outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
+                outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color,
+                simplify_ratio=simplify_ratio, texture_size=texture_size,
             )
+            self._emit_progress(progress_callback, 0.88, "Running post-processing")
             glb = outputs.get("glb", None)
 
             try:
@@ -400,6 +418,7 @@ class InferencePipelinePointMap(InferencePipeline):
                 ):
                     assert glb is not None, "require mesh to run postprocessing"
                     logger.info("Running layout post optimization method...")
+                    self._emit_progress(progress_callback, 0.93, "Optimizing layout pose")
                     postprocessed_pose = self.run_post_optimization(
                         deepcopy(glb),
                         pointmap_dict["intrinsics"],
@@ -414,6 +433,7 @@ class InferencePipelinePointMap(InferencePipeline):
 
             # glb.export("sample.glb")
             logger.info("Finished!")
+            self._emit_progress(progress_callback, 1.0, "Inference complete")
 
             return {
                 **ss_return_dict,

@@ -1,8 +1,15 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 import os
 
-# not ideal to put that here
-os.environ["CUDA_HOME"] = os.environ["CONDA_PREFIX"]
+# Set CUDA_HOME if not already set (works on both Windows and Linux)
+if "CUDA_HOME" not in os.environ:
+    if "CUDA_PATH" in os.environ:
+        # Windows: NVIDIA installer sets CUDA_PATH
+        os.environ["CUDA_HOME"] = os.environ["CUDA_PATH"]
+    elif "CONDA_PREFIX" in os.environ:
+        # Conda environment fallback
+        os.environ["CUDA_HOME"] = os.environ["CONDA_PREFIX"]
+    # Otherwise, leave CUDA_HOME unset and let the system use its default
 os.environ["LIDRA_SKIP_INIT"] = "true"
 
 import sys
@@ -39,43 +46,48 @@ WHITELIST_FILTERS = [
     lambda target: target.split(".", 1)[0] in {"sam3d_objects", "torch", "torchvision", "moge"},
 ]
 
+# Build blacklist set, filtering out None values for platform-specific functions
+# that don't exist on all operating systems (e.g., os.fchdir, os.fork on Windows)
+_BLACKLIST_FUNCS = {
+    builtins.exec,
+    builtins.eval,
+    builtins.__import__,
+    os.system,
+    os.putenv,
+    os.remove,
+    os.removedirs,
+    os.rmdir,
+    os.rename,
+    os.renames,
+    os.replace,
+    os.unlink,
+    os.chmod,
+    os.getcwd,
+    os.chdir,
+    shutil.rmtree,
+    shutil.move,
+    subprocess.Popen,
+    builtins.help,
+    # Platform-specific functions (may not exist on Windows)
+    getattr(os, 'kill', None),
+    getattr(os, 'truncate', None),
+    getattr(os, 'fchdir', None),
+    getattr(os, 'setuid', None),
+    getattr(os, 'fork', None),
+    getattr(os, 'forkpty', None),
+    getattr(os, 'killpg', None),
+    getattr(os, 'fchmod', None),
+    getattr(os, 'fchown', None),
+    getattr(os, 'chown', None),
+    getattr(os, 'chroot', None),
+    getattr(os, 'lchown', None),
+    getattr(shutil, 'chown', None),
+}
+# Remove None values (functions that don't exist on this platform)
+_BLACKLIST_FUNCS.discard(None)
+
 BLACKLIST_FILTERS = [
-    lambda target: get_method(target)
-    in {
-        builtins.exec,
-        builtins.eval,
-        builtins.__import__,
-        os.kill,
-        os.system,
-        os.putenv,
-        os.remove,
-        os.removedirs,
-        os.rmdir,
-        os.fchdir,
-        os.setuid,
-        os.fork,
-        os.forkpty,
-        os.killpg,
-        os.rename,
-        os.renames,
-        os.truncate,
-        os.replace,
-        os.unlink,
-        os.fchmod,
-        os.fchown,
-        os.chmod,
-        os.chown,
-        os.chroot,
-        os.fchdir,
-        os.lchown,
-        os.getcwd,
-        os.chdir,
-        shutil.rmtree,
-        shutil.move,
-        shutil.chown,
-        subprocess.Popen,
-        builtins.help,
-    },
+    lambda target: get_method(target) in _BLACKLIST_FUNCS,
 ]
 
 
@@ -104,19 +116,46 @@ class Inference:
         mask: Optional[Union[None, Image.Image, np.ndarray]],
         seed: Optional[int] = None,
         pointmap=None,
+        *,
+        stage1_only: bool = False,
+        with_mesh_postprocess: bool = False,
+        with_texture_baking: bool = False,
+        with_layout_postprocess: bool = True,
+        use_vertex_color: bool = True,
+        stage1_inference_steps: Optional[int] = None,
+        stage2_inference_steps: Optional[int] = None,
+        stage1_cfg_strength: Optional[float] = None,
+        stage2_cfg_strength: Optional[float] = None,
+        use_stage1_distillation: bool = False,
+        use_stage2_distillation: bool = False,
+        decode_formats: Optional[List[str]] = None,
+        estimate_plane: bool = False,
+        simplify_ratio: float = 0.95,
+        texture_size: int = 1024,
+        progress_callback: Optional[Callable[[str, Optional[float]], None]] = None,
     ) -> dict:
         image = self.merge_mask_to_rgba(image, mask)
         return self._pipeline.run(
             image,
             None,
             seed,
-            stage1_only=False,
-            with_mesh_postprocess=False,
-            with_texture_baking=False,
-            with_layout_postprocess=True,
-            use_vertex_color=True,
-            stage1_inference_steps=None,
+            stage1_only=stage1_only,
+            with_mesh_postprocess=with_mesh_postprocess,
+            with_texture_baking=with_texture_baking,
+            with_layout_postprocess=with_layout_postprocess,
+            use_vertex_color=use_vertex_color,
+            stage1_inference_steps=stage1_inference_steps,
+            stage2_inference_steps=stage2_inference_steps,
+            stage1_cfg_strength=stage1_cfg_strength,
+            stage2_cfg_strength=stage2_cfg_strength,
+            use_stage1_distillation=use_stage1_distillation,
+            use_stage2_distillation=use_stage2_distillation,
             pointmap=pointmap,
+            decode_formats=decode_formats,
+            estimate_plane=estimate_plane,
+            simplify_ratio=simplify_ratio,
+            texture_size=texture_size,
+            progress_callback=progress_callback,
         )
 
 

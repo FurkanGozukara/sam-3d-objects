@@ -202,6 +202,15 @@ class InferencePipeline:
             self.slat_mean = torch.tensor(slat_mean)
             self.slat_std = torch.tensor(slat_std)
 
+    @staticmethod
+    def _emit_progress(callback, fraction, message):
+        if callback is None:
+            return
+        try:
+            callback(message, fraction)
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"Progress callback failed: {exc}")
+
     def _compile(self):
         torch._dynamo.config.cache_size_limit = 64
         torch._dynamo.config.accumulated_cache_size_limit = 2048
@@ -532,7 +541,8 @@ class InferencePipeline:
             }
 
     def postprocess_slat_output(
-        self, outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
+        self, outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color,
+        simplify_ratio=0.95, texture_size=1024,
     ):
         # GLB files can be extracted from the outputs
         logger.info(
@@ -543,8 +553,8 @@ class InferencePipeline:
                 outputs["gaussian"][0],
                 outputs["mesh"][0],
                 # Optional parameters
-                simplify=0.95,  # Ratio of triangles to remove in the simplification process
-                texture_size=1024,  # Size of the texture used for the GLB
+                simplify=simplify_ratio,  # Ratio of triangles to remove in the simplification process
+                texture_size=texture_size,  # Size of the texture used for the GLB
                 verbose=False,
                 with_mesh_postprocess=with_mesh_postprocess,
                 with_texture_baking=with_texture_baking,
@@ -640,7 +650,12 @@ class InferencePipeline:
         return condition_args, condition_kwargs
 
     def sample_sparse_structure(
-        self, ss_input_dict: dict, inference_steps=None, use_distillation=False
+        self,
+        ss_input_dict: dict,
+        inference_steps=None,
+        cfg_strength=None,
+        use_distillation=False,
+        progress_callback=None,
     ):
         ss_generator = self.models["ss_generator"]
         ss_decoder = self.models["ss_decoder"]
@@ -650,7 +665,8 @@ class InferencePipeline:
             ss_generator.reverse_fn.strength_pm = 0
         else:
             ss_generator.no_shortcut = True
-            ss_generator.reverse_fn.strength = self.ss_cfg_strength
+            # Use provided cfg_strength or fall back to default
+            ss_generator.reverse_fn.strength = cfg_strength if cfg_strength is not None else self.ss_cfg_strength
             ss_generator.reverse_fn.strength_pm = self.ss_cfg_strength_pm
 
         prev_inference_steps = ss_generator.inference_steps
@@ -683,22 +699,34 @@ class InferencePipeline:
                     ss_input_dict,
                     self.ss_condition_input_mapping,
                 )
+                self._emit_progress(
+                    progress_callback,
+                    0.38,
+                    "Stage 1 condition embedder finished",
+                )
+                logger.info("Starting ss_generator forward pass...")
+                logger.info(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                logger.info(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
                 return_dict = ss_generator(
                     latent_shape_dict,
                     image.device,
                     *condition_args,
                     **condition_kwargs,
                 )
+                logger.info("ss_generator forward pass completed!")
                 if not self.is_mm_dit():
                     return_dict = {"shape": return_dict}
 
                 shape_latent = return_dict["shape"]
+                logger.info("Starting ss_decoder...")
                 ss = ss_decoder(
                     shape_latent.permute(0, 2, 1)
                     .contiguous()
                     .view(shape_latent.shape[0], 8, 16, 16, 16)
                 )
+                logger.info("ss_decoder completed, extracting coordinates...")
                 coords = torch.argwhere(ss > 0)[:, [0, 2, 3, 4]].int()
+                logger.info(f"Found {coords.shape[0]} sparse structure coordinates")
 
                 # downsample output
                 return_dict["coords_original"] = coords
@@ -712,6 +740,11 @@ class InferencePipeline:
                 logger.info(
                     f"Downsampled coords from {original_shape[0]} to {coords.shape[0]}"
                 )
+                self._emit_progress(
+                    progress_callback,
+                    0.42,
+                    "Sparse structure downsampled",
+                )
                 return_dict["coords"] = coords
                 return_dict["downsample_factor"] = downsample_factor
 
@@ -723,7 +756,9 @@ class InferencePipeline:
         slat_input: dict,
         coords: torch.Tensor,
         inference_steps=25,
+        cfg_strength=None,
         use_distillation=False,
+        progress_callback=None,
     ) -> sp.SparseTensor:
         image = slat_input["image"]
         DEVICE = image.device
@@ -737,7 +772,8 @@ class InferencePipeline:
             slat_generator.reverse_fn.strength = 0
         else:
             slat_generator.no_shortcut = True
-            slat_generator.reverse_fn.strength = self.slat_cfg_strength
+            # Use provided cfg_strength or fall back to default
+            slat_generator.reverse_fn.strength = cfg_strength if cfg_strength is not None else self.slat_cfg_strength
 
         logger.info(
             "Sampling sparse latent: inference_steps={}, strength={}, interval={}, rescale_t={}",
@@ -754,6 +790,11 @@ class InferencePipeline:
                     slat_input,
                     self.slat_condition_input_mapping,
                 )
+                self._emit_progress(
+                    progress_callback,
+                    0.62,
+                    "Stage 2 condition embedder finished",
+                )
                 condition_args += (coords.cpu().numpy(),)
                 slat = slat_generator(
                     latent_shape, DEVICE, *condition_args, **condition_kwargs
@@ -763,6 +804,11 @@ class InferencePipeline:
                     feats=slat[0],
                 ).to(DEVICE)
                 slat = slat * self.slat_std.to(DEVICE) + self.slat_mean.to(DEVICE)
+                self._emit_progress(
+                    progress_callback,
+                    0.72,
+                    "Sparse latent sampled",
+                )
 
         slat_generator.inference_steps = prev_inference_steps
         return slat
